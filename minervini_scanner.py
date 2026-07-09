@@ -1,8 +1,9 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import time, os
-from datetime import datetime
+import time, os, csv, math
+from pathlib import Path
+from datetime import datetime, date
 
 WATCHLIST = [
     "NVDA","AAPL","MSFT","AMZN","GOOGL","META","AVGO","AMD","TSLA","ARM","PLTR","NFLX",
@@ -23,6 +24,141 @@ MIN_RS    = 70
 MAX_DIST  = 0.35
 STOP_PCT  = 0.08
 VOL_MIN   = 0.8
+PORTFOLIO_VALUE = 100_000
+RISK_PER_TRADE_PCT = 1.0
+
+
+def load_watchlist(path=None):
+    """Load tickers from watchlist.csv when present; fallback to built-in WATCHLIST."""
+    if path is None:
+        path = Path(__file__).with_name("watchlist.csv")
+    path = Path(path)
+    tickers = []
+    if path.exists():
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            has_header = "ticker" in sample.splitlines()[0].lower() if sample.splitlines() else False
+            if has_header:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    raw = (row.get("ticker") or row.get("Ticker") or "").strip()
+                    if raw and not raw.startswith("#"):
+                        tickers.append(raw.upper())
+            else:
+                for line in f:
+                    raw = line.split(",")[0].strip()
+                    if raw and not raw.startswith("#"):
+                        tickers.append(raw.upper())
+    else:
+        tickers = list(WATCHLIST)
+    deduped = []
+    seen = set()
+    for ticker in tickers:
+        if ticker not in seen:
+            deduped.append(ticker)
+            seen.add(ticker)
+    return deduped
+
+
+def calc_rs_raw(sdf, mdf):
+    try:
+        n = min(len(sdf), len(mdf))
+        if n < 126:
+            return None
+        def ret(df, days):
+            if len(df) <= days:
+                return None
+            return df["Close"].iloc[-1] / df["Close"].iloc[-days] - 1
+        periods = [(63, 0.4), (126, 0.3), (189, 0.2), (252, 0.1)]
+        stock_score = 0
+        market_score = 0
+        used = 0
+        for days, weight in periods:
+            sr = ret(sdf, days)
+            mr = ret(mdf, days)
+            if sr is not None and mr is not None:
+                stock_score += sr * weight
+                market_score += mr * weight
+                used += weight
+        if used == 0:
+            return None
+        return (stock_score - market_score) / used
+    except Exception:
+        return None
+
+
+def calc_rs_percentiles(scores):
+    valid = {k: v for k, v in scores.items() if v is not None and not pd.isna(v)}
+    if not valid:
+        return {}
+    ordered = sorted(valid.items(), key=lambda kv: kv[1])
+    n = len(ordered)
+    if n == 1:
+        return {ordered[0][0]: 99}
+    result = {}
+    for idx, (ticker, _) in enumerate(ordered):
+        result[ticker] = int(round(1 + idx * 98 / (n - 1)))
+    return result
+
+
+def classify_earnings_risk(next_earnings, today=None):
+    if next_earnings is None or pd.isna(next_earnings):
+        return "Unknown", None
+    if today is None:
+        today = date.today()
+    if hasattr(next_earnings, "date"):
+        next_earnings = next_earnings.date()
+    days = (next_earnings - today).days
+    if days < 0:
+        return "Past", days
+    if days <= 5:
+        return "High", days
+    if days <= 10:
+        return "Medium", days
+    if days <= 20:
+        return "Watch", days
+    return "Low", days
+
+
+def get_next_earnings_date(ticker):
+    try:
+        tk = yf.Ticker(ticker)
+        cal = tk.calendar
+        if isinstance(cal, dict):
+            dt = cal.get("Earnings Date") or cal.get("EarningsDate")
+            if isinstance(dt, (list, tuple)):
+                dt = dt[0]
+            if dt is not None:
+                return pd.to_datetime(dt).date()
+        if hasattr(cal, "empty") and not cal.empty:
+            vals = cal.values.flatten()
+            if len(vals):
+                return pd.to_datetime(vals[0]).date()
+        info = getattr(tk, "info", {}) or {}
+        ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
+        if ts:
+            return datetime.fromtimestamp(ts).date()
+    except Exception:
+        pass
+    return None
+
+
+def calc_position_size(portfolio_value, risk_pct, entry_price, stop_price):
+    if not entry_price or not stop_price or stop_price >= entry_price:
+        return {"dollar_risk": round(portfolio_value * risk_pct / 100, 2), "stop_risk_pct": None, "position_value": 0, "shares": 0}
+    dollar_risk = portfolio_value * risk_pct / 100
+    stop_risk_pct = (entry_price - stop_price) / entry_price * 100
+    risk_per_share = entry_price - stop_price
+    shares = int(round(dollar_risk / risk_per_share)) if risk_per_share > 0 else 0
+    position_value = shares * entry_price
+    return {
+        "dollar_risk": round(dollar_risk, 2),
+        "stop_risk_pct": round(stop_risk_pct, 1),
+        "position_value": round(position_value, 2),
+        "shares": shares,
+    }
+
 
 def get_market_regime():
     try:
@@ -212,25 +348,32 @@ def classify_setup_status(current_price, pivot_price, stop_price=None, breakout_
     return "Leadership Candidate"
 
 
-def detect_vcp(df):
+def detect_vcp_details(df):
     try:
         if len(df) < 60:
-            return False, 0, None
+            return {"is_vcp": False, "score": 0, "pivot_price": None, "contractions": []}
         recent = df.tail(90).copy()
         highs, lows = _find_swings(recent, n=3)
         contractions = []
+        reset = recent.reset_index(drop=True)
         for hi_idx, hi_price in highs:
             future_lows = [(li, lp) for li, lp in lows if li > hi_idx]
             if not future_lows:
                 continue
             lo_idx, lo_price = future_lows[0]
             if hi_price > 0:
-                contractions.append({"hi_idx": hi_idx, "lo_idx": lo_idx, "depth": (hi_price - lo_price) / hi_price * 100})
+                contractions.append({
+                    "hi_idx": hi_idx,
+                    "lo_idx": lo_idx,
+                    "high": round(float(hi_price), 2),
+                    "low": round(float(lo_price), 2),
+                    "depth_pct": round((hi_price - lo_price) / hi_price * 100, 1),
+                })
         contractions = contractions[-4:]
-        depths = [x["depth"] for x in contractions]
+        depths = [x["depth_pct"] for x in contractions]
         higher_lows = True
         if len(contractions) >= 2:
-            low_prices = [float(recent["Low"].reset_index(drop=True).iloc[x["lo_idx"]]) for x in contractions]
+            low_prices = [float(reset["Low"].iloc[x["lo_idx"]]) for x in contractions]
             higher_lows = all(low_prices[i] >= low_prices[i-1] * 0.97 for i in range(1, len(low_prices)))
         progressively_shallower = len(depths) >= 2 and all(depths[i] <= depths[i-1] * 1.15 for i in range(1, len(depths)))
         final_tight = bool(depths and depths[-1] <= 10)
@@ -249,9 +392,24 @@ def detect_vcp(df):
         if final_tight: score += 1
         if volume_dry: score += 2
         if near_pivot: score += 2
-        return score >= 6, score, round(float(pivot_price), 2) if pivot_price else None
+        return {
+            "is_vcp": score >= 6,
+            "score": score,
+            "pivot_price": round(float(pivot_price), 2) if pivot_price else None,
+            "contractions": contractions,
+            "contraction_count": len(contractions),
+            "higher_lows": higher_lows,
+            "progressively_shallower": progressively_shallower,
+            "final_tight": final_tight,
+            "volume_dry": volume_dry,
+        }
     except Exception:
-        return False, 0, None
+        return {"is_vcp": False, "score": 0, "pivot_price": None, "contractions": []}
+
+
+def detect_vcp(df):
+    details = detect_vcp_details(df)
+    return details["is_vcp"], details["score"], details["pivot_price"]
 
 def detect_cup_handle(df):
     try:
@@ -355,8 +513,9 @@ def get_vol_ratio(df):
 
 def scan():
     scan_date = datetime.now().strftime("%Y-%m-%d")
+    tickers = load_watchlist()
     print("=" * 60)
-    print(f"  Minervini Scanner v2.0 — {scan_date}")
+    print(f"  Minervini Scanner v3.0 — {scan_date}")
     print("=" * 60)
     print("  Checking market regime...")
     rd = get_market_regime()
@@ -365,21 +524,38 @@ def scan():
     print()
     print("  Downloading SPY data...")
     spy_df = yf.Ticker("SPY").history(period="2y")
-    print(f"  Scanning {len(WATCHLIST)} stocks...")
-    results = []
-    for i, ticker in enumerate(WATCHLIST):
-        print(f"  [{i+1:02d}/{len(WATCHLIST)}] {ticker:<6}", end=" ", flush=True)
+    print(f"  Downloading {len(tickers)} stock charts for RS percentile ranking...")
+    data = {}
+    raw_rs = {}
+    for i, ticker in enumerate(tickers):
         try:
             df = yf.Ticker(ticker).history(period="2y")
-            if len(df) < 200:
+            if len(df) >= 126:
+                data[ticker] = df
+                raw_rs[ticker] = calc_rs_raw(df, spy_df)
+        except Exception:
+            pass
+        time.sleep(0.05)
+    rs_rank = calc_rs_percentiles(raw_rs)
+
+    print(f"  Scanning {len(tickers)} stocks...")
+    results = []
+    for i, ticker in enumerate(tickers):
+        print(f"  [{i+1:02d}/{len(tickers)}] {ticker:<6}", end=" ", flush=True)
+        try:
+            df = data.get(ticker)
+            if df is None or len(df) < 200:
                 print("skip")
                 continue
             trend_score, checks = check_trend(df)
-            rs = calc_rs(df, spy_df)
+            rs = rs_rank.get(ticker) or calc_rs(df, spy_df)
             eps, rev, mcap, sector = get_fundamentals(ticker)
+            next_earnings = get_next_earnings_date(ticker)
+            earnings_risk, days_to_earnings = classify_earnings_risk(next_earnings)
             vol_ratio = get_vol_ratio(df)
             base = detect_base_and_pivot(df)
-            is_vcp, vcp_score, vcp_pivot = detect_vcp(df)
+            vcp_details = detect_vcp_details(df)
+            is_vcp, vcp_score, vcp_pivot = vcp_details["is_vcp"], vcp_details["score"], vcp_details["pivot_price"]
             is_cup, cup_pivot, cup_depth_pct, handle_depth_pct = detect_cup_handle(df)
             hist_pivot_price, hist_pivot_date, hist_pivot_method = detect_historical_pivot(df)
             cp   = df["Close"].iloc[-1]
@@ -403,12 +579,14 @@ def scan():
                 breakout_occurred=bool(base.get("breakout_occurred")) if base else bool(pivot_price and cp >= pivot_price),
                 quiet_volume_ratio=base.get("quiet_volume_ratio") if base else None,
             )
+            pos = calc_position_size(PORTFOLIO_VALUE, RISK_PER_TRADE_PCT, float(cp), float(stop_price) if stop_price else None)
             # Allow Rev>30% to substitute missing EPS. Missing fundamentals no longer hide a valid technical setup.
             eps_ok = (eps or 0) >= MIN_EPS or (eps is None and (rev or 0) >= 0.30)
             fundamentals_ok = eps_ok and ((rev or 0) >= MIN_REV or rev is None)
             trend_rs_ok = trend_score >= MIN_TREND and (rs or 0) >= MIN_RS and dist >= -MAX_DIST * 100
             actionable_status = setup_status in {"Retest Watch", "Actionable Pivot", "Pivot Approaching", "Setup Forming"}
-            passed = trend_rs_ok and (fundamentals_ok or actionable_status)
+            earnings_ok = earnings_risk not in {"High"}
+            passed = trend_rs_ok and earnings_ok and (fundamentals_ok or actionable_status)
             if passed:
                 if setup_status in {"Retest Watch", "Actionable Pivot", "Pivot Approaching"} and (rs or 0) >= 90:
                     tier = "A"
@@ -420,10 +598,10 @@ def scan():
                     "ticker": ticker, "sector": sector,
                     "price": round(cp,2), "dist": round(dist,1),
                     "stop": round(stop_price, 2) if stop_price else round(cp * (1 - STOP_PCT), 2), "trend": trend_score,
-                    "checks": checks, "rs": rs, "eps": eps,
-                    "rev": rev, "vol_ratio": vol_ratio,
+                    "checks": checks, "rs": rs, "rs_raw": round(raw_rs.get(ticker), 4) if raw_rs.get(ticker) is not None else None,
+                    "eps": eps, "rev": rev, "vol_ratio": vol_ratio,
                     "mcap": mcap, "is_vcp": is_vcp,
-                    "vcp_score": vcp_score, "tier": tier,
+                    "vcp_score": vcp_score, "vcp_details": vcp_details, "tier": tier,
                     "add1": round(cp*1.10, 2),
                     "add2": round(cp*1.20, 2),
                     "max_pos": round(cp*1.10*0.9, 2),
@@ -435,6 +613,11 @@ def scan():
                     "quiet_volume_ratio": base.get("quiet_volume_ratio") if base else None,
                     "atr_pct": base.get("atr_pct") if base else None,
                     "stop_risk_pct": base.get("stop_risk_pct") if base else None,
+                    "shares": pos.get("shares"),
+                    "position_value": pos.get("position_value"),
+                    "earnings_date": next_earnings.isoformat() if next_earnings else None,
+                    "earnings_risk": earnings_risk,
+                    "days_to_earnings": days_to_earnings,
                     "hist_pivot_price": hist_pivot_price,
                     "hist_pivot_date": hist_pivot_date,
                     "hist_pivot_dist": hist_pivot_dist,
@@ -443,11 +626,11 @@ def scan():
                 vcp_tag = " [VCP]" if is_vcp else ""
                 print(f"PASS RS={rs} Pivot={pivot_dist if pivot_dist is not None else 'N/A'}% {setup_status} Tier={tier}{vcp_tag}")
             else:
-                print(f"fail (trend={trend_score}/8 rs={rs} dist={dist:+.1f}% pivot={pivot_dist} status={setup_status})")
+                print(f"fail (trend={trend_score}/8 rs={rs} dist={dist:+.1f}% pivot={pivot_dist} status={setup_status} ER={earnings_risk})")
         except Exception as e:
             print(f"error ({e})")
-        time.sleep(0.3)
-    results.sort(key=lambda x: (x["tier"], -x["dist"]))
+        time.sleep(0.15)
+    results.sort(key=lambda x: (x["tier"], -int(x.get("rs") or 0), abs(x.get("pivot_dist") or 99)))
     return results, rd, scan_date
 
 def build_html(results, rd, scan_date):
@@ -503,6 +686,20 @@ def build_html(results, rd, scan_date):
             bars += f"<span style='display:inline-block;width:18px;height:14px;background:{col};border-radius:2px;margin:1px'></span>"
         return f"<div style='display:flex;align-items:center;gap:2px'>{bars}<span style='margin-left:4px;font-size:12px;color:#888'>{score}/8</span></div>"
 
+    def fmt_vcp_details(r):
+        d = r.get("vcp_details") or {}
+        cons = d.get("contractions") or []
+        depths = "/".join([f"{c.get('depth_pct')}%" for c in cons[-3:]]) or "—"
+        return f"Score {r.get('vcp_score',0)}/10<br><span style='font-size:10px;color:#888'>C: {depths}</span>"
+
+    def fmt_earnings(r):
+        risk = r.get("earnings_risk") or "Unknown"
+        color = {"High":"#e24b4a","Medium":"#f5a623","Watch":"#f5a623","Low":"#27a03a"}.get(risk, "#888")
+        date_txt = r.get("earnings_date") or "N/A"
+        days = r.get("days_to_earnings")
+        day_txt = f"{days}d" if days is not None else ""
+        return f"<span style='color:{color};font-weight:600'>{risk}</span><br><span style='font-size:10px;color:#888'>{date_txt} {day_txt}</span>"
+
     r_col = {"BULL":"#27a03a","NEUTRAL":"#f5a623","BEAR":"#e24b4a"}.get(rd["regime"],"#888")
     rows = ""
     for r in results:
@@ -517,6 +714,9 @@ def build_html(results, rd, scan_date):
           <td>{trend_bar(r['trend'],r['checks'])}</td>
           <td>{fmt_rs(r['rs'])}</td>
           <td><strong>{r.get('setup_status','—')}</strong><br><span style='font-size:10px;color:#888'>Risk {r.get('stop_risk_pct','—')}%</span></td>
+          <td>{fmt_vcp_details(r)}</td>
+          <td>{fmt_earnings(r)}</td>
+          <td>{r.get('shares','—')}<br><span style='font-size:10px;color:#888'>${r.get('position_value',0):,.0f}</span></td>
           <td>{fmt_pct(r['eps'])}</td>
           <td>{fmt_pct(r['rev'])}</td>
           <td style='color:#e24b4a;font-weight:600'>${r['stop']}</td>
@@ -571,7 +771,7 @@ def save_report(results, rd, scan_date):
 <html lang="zh-TW"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Minervini v2.0 — {scan_date}</title>
+<title>Minervini v3.0 — {scan_date}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;color:#1d1d1f;font-size:14px}}
@@ -606,8 +806,8 @@ tr:hover td{{background:#fafafa}}
 .ft{{padding:12px 32px;color:#aaa;font-size:11px;text-align:center}}
 </style></head><body>
 <div class="hdr">
-  <h1>&#9889; Minervini Scanner &#8212; USIC 2026 <span style="font-size:14px;background:#7f5af0;color:#fff;padding:2px 10px;border-radius:12px;margin-left:8px">v2.0</span></h1>
-  <p>Date: {scan_date} | Scanned: {len(WATCHLIST)} | Passed: {len(results)} | Vol filter: &ge;{VOL_MIN}x | Stop: {int(STOP_PCT*100)}%</p>
+  <h1>&#9889; Minervini Scanner &#8212; USIC 2026 <span style="font-size:14px;background:#7f5af0;color:#fff;padding:2px 10px;border-radius:12px;margin-left:8px">v3.0</span></h1>
+  <p>Date: {scan_date} | Scanned: {len(load_watchlist())} | Passed: {len(results)} | RS percentile | Risk/trade: {RISK_PER_TRADE_PCT}%</p>
 </div>
 <div class="rbar">
   <span class="rbadge">{rd['regime']}</span>
@@ -629,7 +829,7 @@ tr:hover td{{background:#fafafa}}
   <div class="met"><div class="met-l">Tier A setups</div><div class="met-v" style="color:#27a03a">{tier_a}</div></div>
 </div>
 {candidates_html}
-<div class="v2note">&#9888; v2.0: Volume &ge;{VOL_MIN}x · 8% stop loss · Dynamic position sizing · VCP detection · Tiers A/B/C · Pyramiding: Add 1 at +10% / Add 2 at +20% (purple)</div>
+<div class="v2note">&#9888; v3.0: External watchlist · RS percentile · Local pivot distance · Setup status · VCP contraction depths · Earnings risk · Position sizing</div>
 <div class="flt">
   <label>Search: <input type="text" id="sb" placeholder="ticker..." oninput="ft()"></label>
   <label>Tier: <select id="ts" onchange="ft()"><option value="">All</option><option>A</option><option>B</option><option>C</option></select></label>
@@ -638,11 +838,11 @@ tr:hover td{{background:#fafafa}}
 </div>
 <div class="tw"><table>
   <thead><tr>
-    <th style="position:sticky;left:0;background:#f5f5f7;z-index:2">Ticker</th><th>Tier</th><th>Price</th><th>From High</th><th>Trend Score</th><th>RS</th><th>Setup</th><th>EPS</th><th>Revenue</th><th>Stop Loss</th><th style="color:#7f5af0">Add 1 +10%</th><th style="color:#7f5af0">Add 2 +20%</th><th>Vol Ratio</th><th>Mkt Cap</th><th style="white-space:normal;min-width:90px;padding:9px 8px">Pivot</th><th style="white-space:normal;min-width:110px;padding:9px 8px">歷史Pivot</th>
+    <th style="position:sticky;left:0;background:#f5f5f7;z-index:2">Ticker</th><th>Tier</th><th>Price</th><th>From High</th><th>Trend Score</th><th>RS</th><th>Setup</th><th>VCP</th><th>Earnings</th><th>Size</th><th>EPS</th><th>Revenue</th><th>Stop Loss</th><th style="color:#7f5af0">Add 1 +10%</th><th style="color:#7f5af0">Add 2 +20%</th><th>Vol Ratio</th><th>Mkt Cap</th><th style="white-space:normal;min-width:90px;padding:9px 8px">Pivot</th><th style="white-space:normal;min-width:110px;padding:9px 8px">歷史Pivot</th>
   </tr></thead>
   <tbody id="tb">{rows}</tbody>
 </table></div>
-<div class="ft">Research only | Minervini Scanner v2.0 | {scan_date}</div>
+<div class="ft">Research only | Minervini Scanner v3.0 | {scan_date}</div>
 <script>
 function ft(){{
   var q=document.getElementById('sb').value.toLowerCase();
@@ -672,7 +872,7 @@ if __name__ == "__main__":
     wp = abs_path.replace("/home/wahmui", "").replace("/", "\\")
     win_path = "\\\\wsl.localhost\\Ubuntu\\home\\wahmui" + wp
     print("=" * 60)
-    print(f"  {len(results)} stocks passed (v2.0 filters)")
+    print(f"  {len(results)} stocks passed (v3.0 filters)")
     tier_a = [r for r in results if r["tier"]=="A"]
     tier_b = [r for r in results if r["tier"]=="B"]
     tier_c = [r for r in results if r["tier"]=="C"]
