@@ -12,6 +12,8 @@ WATCHLIST = [
     "V","MA","HOOD","SQ","PYPL","GS","MS","BAC","AXP","BLK","SCHW",
     "COST","BKNG","MELI","SHOP","UBER","ABNB","DUOL","ELF","CELH","WING","CVNA",
     "LLY","VRTX","REGN","ISRG","AMGN","TMO","DHR","SPOT","EA","COHR","LITE","AAOI","VIAV","CIEN",
+    # Current AI infrastructure / momentum leaders that were missing from v2.0
+    "ANET","PENG","ALAB","CRWV",
 ]
 
 MIN_TREND = 6
@@ -98,24 +100,158 @@ def check_trend(df):
     ]
     return sum(checks), checks
 
+def calc_atr(df, period=14):
+    try:
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        return float(tr.rolling(period).mean().iloc[-1])
+    except Exception:
+        return None
+
+
+def _find_swings(recent, n=3):
+    highs, lows = [], []
+    h = recent["High"].reset_index(drop=True)
+    l = recent["Low"].reset_index(drop=True)
+    c = recent["Close"].reset_index(drop=True)
+    for i in range(n, len(recent) - n):
+        if h.iloc[i] >= h.iloc[i-n:i+n+1].max():
+            highs.append((i, float(h.iloc[i])))
+        if l.iloc[i] <= l.iloc[i-n:i+n+1].min():
+            lows.append((i, float(l.iloc[i])))
+    if not highs:
+        highs.append((int(c.idxmax()), float(c.max())))
+    if not lows:
+        lows.append((int(c.idxmin()), float(c.min())))
+    return highs, lows
+
+
+def detect_base_and_pivot(df, lookback=80):
+    """Detect the current local base and actionable right-side pivot."""
+    try:
+        if len(df) < 40:
+            return None
+        recent = df.tail(min(lookback, len(df))).copy()
+        close = recent["Close"]
+        current = float(close.iloc[-1])
+        base_high = float(recent["High"].max())
+        base_low = float(recent["Low"].min())
+        if base_high <= 0:
+            return None
+        base_depth_pct = (base_high - base_low) / base_high * 100
+
+        # Right-side resistance shelf: recent highs before today's candle.
+        shelf = recent.iloc[:-1].tail(20)
+        if len(shelf) < 5:
+            shelf = recent.iloc[:-1]
+        pivot_price = float(shelf["High"].max()) if len(shelf) else base_high
+        pivot_date_idx = shelf["High"].idxmax() if len(shelf) else recent["High"].idxmax()
+        pivot_date = pivot_date_idx.strftime("%Y-%m-%d") if hasattr(pivot_date_idx, "strftime") else str(pivot_date_idx)[:10]
+        distance_from_pivot_pct = (current / pivot_price - 1) * 100 if pivot_price else None
+
+        avg20 = float(recent["Volume"].rolling(20).mean().iloc[-1]) if len(recent) >= 20 else float(recent["Volume"].mean())
+        quiet_volume_ratio = float(recent["Volume"].tail(5).mean() / avg20) if avg20 > 0 else None
+        atr = calc_atr(df)
+        atr_pct = atr / current * 100 if atr and current else None
+        raw_stop = float(recent["Low"].tail(15).min())
+        # For active breakout/retest candidates, a stale low from the left side of the base
+        # makes risk look unusably wide.  Use ~6% below the local pivot as the practical
+        # invalidation floor, but never place the stop above current price.
+        pivot_stop = pivot_price * 0.94 if current >= pivot_price * 0.92 else raw_stop
+        stop_price = max(raw_stop, pivot_stop)
+        if stop_price >= current:
+            stop_price = raw_stop
+        stop_risk_pct = (current - stop_price) / current * 100 if stop_price < current else None
+        breakout_occurred = current >= pivot_price
+
+        return {
+            "base_high": round(base_high, 2),
+            "base_low": round(base_low, 2),
+            "base_depth_pct": round(base_depth_pct, 1),
+            "base_length": len(recent),
+            "pivot_price": round(pivot_price, 2),
+            "pivot_date": pivot_date,
+            "distance_from_pivot_pct": round(distance_from_pivot_pct, 1) if distance_from_pivot_pct is not None else None,
+            "quiet_volume_ratio": round(quiet_volume_ratio, 2) if quiet_volume_ratio is not None else None,
+            "atr_pct": round(atr_pct, 1) if atr_pct is not None else None,
+            "stop_price": round(stop_price, 2),
+            "stop_risk_pct": round(stop_risk_pct, 1) if stop_risk_pct is not None else None,
+            "breakout_occurred": breakout_occurred,
+        }
+    except Exception:
+        return None
+
+
+def classify_setup_status(current_price, pivot_price, stop_price=None, breakout_occurred=False, quiet_volume_ratio=None):
+    if not pivot_price:
+        return "Leadership Candidate"
+    dist = (current_price / pivot_price - 1) * 100
+    stop_risk = (current_price - stop_price) / current_price * 100 if stop_price and stop_price < current_price else None
+    quiet = quiet_volume_ratio is not None and quiet_volume_ratio <= 0.8
+    risk_ok = stop_risk is None or stop_risk <= 8
+
+    if dist > 8:
+        return "Extended"
+    if breakout_occurred and -3 <= dist <= 1 and quiet and risk_ok:
+        return "Retest Watch"
+    if 0 <= dist <= 5 and risk_ok:
+        return "Actionable Pivot"
+    if -3 <= dist < 0:
+        return "Pivot Approaching"
+    if -8 <= dist < -3:
+        return "Setup Forming"
+    if stop_risk is not None and stop_risk > 10:
+        return "Base Repair"
+    return "Leadership Candidate"
+
+
 def detect_vcp(df):
     try:
-        if len(df) < 60: return False, 0, None
-        recent = df.tail(30)
-        c = recent["Close"]
-        v = recent["Volume"]
-        seg     = [c.iloc[i*10:(i+1)*10] for i in range(3)]
-        vol_seg = [v.iloc[i*10:(i+1)*10] for i in range(3)]
-        pullbacks = [(s.max()-s.min())/s.max() for s in seg]
-        vol_trend = [vs.mean() for vs in vol_seg]
-        contracting = pullbacks[0] > pullbacks[1] > pullbacks[2]
-        vol_drying  = vol_trend[0] > vol_trend[1] > vol_trend[2]
-        tight_range = pullbacks[2] < 0.05
-        near_high   = c.iloc[-1] >= c.max() * 0.97
-        vcp_score = sum([contracting, vol_drying, tight_range, near_high])
-        pivot_price = round(float(seg[2].max()), 2) if vcp_score >= 3 else None
-        return vcp_score >= 3, vcp_score, pivot_price
-    except: return False, 0, None
+        if len(df) < 60:
+            return False, 0, None
+        recent = df.tail(90).copy()
+        highs, lows = _find_swings(recent, n=3)
+        contractions = []
+        for hi_idx, hi_price in highs:
+            future_lows = [(li, lp) for li, lp in lows if li > hi_idx]
+            if not future_lows:
+                continue
+            lo_idx, lo_price = future_lows[0]
+            if hi_price > 0:
+                contractions.append({"hi_idx": hi_idx, "lo_idx": lo_idx, "depth": (hi_price - lo_price) / hi_price * 100})
+        contractions = contractions[-4:]
+        depths = [x["depth"] for x in contractions]
+        higher_lows = True
+        if len(contractions) >= 2:
+            low_prices = [float(recent["Low"].reset_index(drop=True).iloc[x["lo_idx"]]) for x in contractions]
+            higher_lows = all(low_prices[i] >= low_prices[i-1] * 0.97 for i in range(1, len(low_prices)))
+        progressively_shallower = len(depths) >= 2 and all(depths[i] <= depths[i-1] * 1.15 for i in range(1, len(depths)))
+        final_tight = bool(depths and depths[-1] <= 10)
+        base = detect_base_and_pivot(df, lookback=90)
+        pivot_price = base["pivot_price"] if base else float(recent["High"].tail(20).max())
+        dist = base["distance_from_pivot_pct"] if base else None
+        near_pivot = dist is not None and -8 <= dist <= 8
+        avg50 = float(recent["Volume"].rolling(50).mean().iloc[-1]) if len(recent) >= 50 else float(recent["Volume"].mean())
+        final_vol = float(recent["Volume"].tail(5).mean())
+        volume_dry = final_vol <= avg50 * 0.9 if avg50 > 0 else False
+
+        score = 0
+        if 2 <= len(contractions) <= 4: score += 2
+        if progressively_shallower: score += 2
+        if higher_lows: score += 1
+        if final_tight: score += 1
+        if volume_dry: score += 2
+        if near_pivot: score += 2
+        return score >= 6, score, round(float(pivot_price), 2) if pivot_price else None
+    except Exception:
+        return False, 0, None
 
 def detect_cup_handle(df):
     try:
@@ -242,6 +378,7 @@ def scan():
             rs = calc_rs(df, spy_df)
             eps, rev, mcap, sector = get_fundamentals(ticker)
             vol_ratio = get_vol_ratio(df)
+            base = detect_base_and_pivot(df)
             is_vcp, vcp_score, vcp_pivot = detect_vcp(df)
             is_cup, cup_pivot, cup_depth_pct, handle_depth_pct = detect_cup_handle(df)
             hist_pivot_price, hist_pivot_date, hist_pivot_method = detect_historical_pivot(df)
@@ -252,34 +389,37 @@ def scan():
                 pattern, pivot_price = "VCP", vcp_pivot
             elif is_cup and cup_pivot is not None:
                 pattern, pivot_price = "CUP", cup_pivot
+            elif base and base.get("pivot_price"):
+                pattern, pivot_price = "BASE", base["pivot_price"]
             else:
                 pattern, pivot_price = None, None
             pivot_dist = round((cp / pivot_price - 1) * 100, 1) if pivot_price else None
             hist_pivot_dist = round((cp / hist_pivot_price - 1) * 100, 1) if hist_pivot_price else None
-            stop_price = round(cp * (1 - STOP_PCT), 2)
-            # Allow Rev>30% to substitute missing EPS
-            eps_ok = (eps or 0) >= MIN_EPS or (eps is None and (rev or 0) >= 0.30)
-            passed = (
-                trend_score >= MIN_TREND and
-                (rs or 0) >= MIN_RS and
-                eps_ok and
-                (rev or 0) >= MIN_REV and
-                dist >= -MAX_DIST * 100 and
-                vol_ratio >= VOL_MIN
+            stop_price = base.get("stop_price") if base else round(cp * (1 - STOP_PCT), 2)
+            setup_status = classify_setup_status(
+                current_price=float(cp),
+                pivot_price=pivot_price,
+                stop_price=stop_price,
+                breakout_occurred=bool(base.get("breakout_occurred")) if base else bool(pivot_price and cp >= pivot_price),
+                quiet_volume_ratio=base.get("quiet_volume_ratio") if base else None,
             )
+            # Allow Rev>30% to substitute missing EPS. Missing fundamentals no longer hide a valid technical setup.
+            eps_ok = (eps or 0) >= MIN_EPS or (eps is None and (rev or 0) >= 0.30)
+            fundamentals_ok = eps_ok and ((rev or 0) >= MIN_REV or rev is None)
+            trend_rs_ok = trend_score >= MIN_TREND and (rs or 0) >= MIN_RS and dist >= -MAX_DIST * 100
+            actionable_status = setup_status in {"Retest Watch", "Actionable Pivot", "Pivot Approaching", "Setup Forming"}
+            passed = trend_rs_ok and (fundamentals_ok or actionable_status)
             if passed:
-                if is_vcp and dist >= -5:
+                if setup_status in {"Retest Watch", "Actionable Pivot", "Pivot Approaching"} and (rs or 0) >= 90:
                     tier = "A"
-                elif dist >= -5 and (rs or 0) >= 90:
-                    tier = "A"
-                elif dist >= -10:
+                elif actionable_status or (dist >= -10 and (rs or 0) >= 80):
                     tier = "B"
                 else:
                     tier = "C"
                 results.append({
                     "ticker": ticker, "sector": sector,
                     "price": round(cp,2), "dist": round(dist,1),
-                    "stop": stop_price, "trend": trend_score,
+                    "stop": round(stop_price, 2) if stop_price else round(cp * (1 - STOP_PCT), 2), "trend": trend_score,
                     "checks": checks, "rs": rs, "eps": eps,
                     "rev": rev, "vol_ratio": vol_ratio,
                     "mcap": mcap, "is_vcp": is_vcp,
@@ -290,15 +430,20 @@ def scan():
                     "pattern": pattern,
                     "pivot_price": pivot_price,
                     "pivot_dist": pivot_dist,
+                    "setup_status": setup_status,
+                    "base_depth_pct": base.get("base_depth_pct") if base else None,
+                    "quiet_volume_ratio": base.get("quiet_volume_ratio") if base else None,
+                    "atr_pct": base.get("atr_pct") if base else None,
+                    "stop_risk_pct": base.get("stop_risk_pct") if base else None,
                     "hist_pivot_price": hist_pivot_price,
                     "hist_pivot_date": hist_pivot_date,
                     "hist_pivot_dist": hist_pivot_dist,
                     "hist_pivot_method": hist_pivot_method,
                 })
                 vcp_tag = " [VCP]" if is_vcp else ""
-                print(f"PASS RS={rs} Dist={dist:+.1f}% Tier={tier}{vcp_tag}")
+                print(f"PASS RS={rs} Pivot={pivot_dist if pivot_dist is not None else 'N/A'}% {setup_status} Tier={tier}{vcp_tag}")
             else:
-                print(f"fail (trend={trend_score}/8 rs={rs} dist={dist:+.1f}% vol={vol_ratio}x)")
+                print(f"fail (trend={trend_score}/8 rs={rs} dist={dist:+.1f}% pivot={pivot_dist} status={setup_status})")
         except Exception as e:
             print(f"error ({e})")
         time.sleep(0.3)
@@ -371,6 +516,7 @@ def build_html(results, rd, scan_date):
           <td style='color:{dist_col};font-weight:600'>{r['dist']:+.1f}%</td>
           <td>{trend_bar(r['trend'],r['checks'])}</td>
           <td>{fmt_rs(r['rs'])}</td>
+          <td><strong>{r.get('setup_status','—')}</strong><br><span style='font-size:10px;color:#888'>Risk {r.get('stop_risk_pct','—')}%</span></td>
           <td>{fmt_pct(r['eps'])}</td>
           <td>{fmt_pct(r['rev'])}</td>
           <td style='color:#e24b4a;font-weight:600'>${r['stop']}</td>
@@ -492,7 +638,7 @@ tr:hover td{{background:#fafafa}}
 </div>
 <div class="tw"><table>
   <thead><tr>
-    <th style="position:sticky;left:0;background:#f5f5f7;z-index:2">Ticker</th><th>Tier</th><th>Price</th><th>From High</th><th>Trend Score</th><th>RS</th><th>EPS</th><th>Revenue</th><th>Stop Loss</th><th style="color:#7f5af0">Add 1 +10%</th><th style="color:#7f5af0">Add 2 +20%</th><th>Vol Ratio</th><th>Mkt Cap</th><th style="white-space:normal;min-width:90px;padding:9px 8px">Pivot</th><th style="white-space:normal;min-width:110px;padding:9px 8px">歷史Pivot</th>
+    <th style="position:sticky;left:0;background:#f5f5f7;z-index:2">Ticker</th><th>Tier</th><th>Price</th><th>From High</th><th>Trend Score</th><th>RS</th><th>Setup</th><th>EPS</th><th>Revenue</th><th>Stop Loss</th><th style="color:#7f5af0">Add 1 +10%</th><th style="color:#7f5af0">Add 2 +20%</th><th>Vol Ratio</th><th>Mkt Cap</th><th style="white-space:normal;min-width:90px;padding:9px 8px">Pivot</th><th style="white-space:normal;min-width:110px;padding:9px 8px">歷史Pivot</th>
   </tr></thead>
   <tbody id="tb">{rows}</tbody>
 </table></div>
@@ -512,7 +658,9 @@ function ft(){{
 </script>
 </body></html>"""
     fname = f"minervini_{scan_date}.html"
-    fpath = os.path.expanduser(f"~/minervini-ai-screener/{fname}")
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    fpath = os.path.join(out_dir, fname)
     with open(fpath, "w", encoding="utf-8") as f:
         f.write(html)
     return fpath
@@ -545,7 +693,10 @@ if __name__ == "__main__":
     import subprocess, shutil
     desktop = "/mnt/c/Users/Wah Mui/Desktop"
     report_name = os.path.basename(fpath)
-    shutil.copy(fpath, f"{desktop}/{report_name}")
-    win_file = f"C:\\Users\\Wah Mui\\Desktop\\{report_name}"
-    subprocess.Popen(["powershell.exe", "-Command", f"Start-Process '{win_file}'"])
-    print("Scan complete! Browser opening...")
+    if os.path.isdir(desktop):
+        shutil.copy(fpath, f"{desktop}/{report_name}")
+        win_file = f"C:\\Users\\Wah Mui\\Desktop\\{report_name}"
+        subprocess.Popen(["powershell.exe", "-Command", f"Start-Process '{win_file}'"])
+        print("Scan complete! Browser opening...")
+    else:
+        print(f"Scan complete! Report saved to {fpath}")

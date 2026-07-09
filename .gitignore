@@ -1,5 +1,8 @@
 venv/
+.venv/
 __pycache__/
+.pytest_cache/
+reports/*.html
 *.pyc
 *.pyo
 .env
