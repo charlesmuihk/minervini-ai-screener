@@ -2,6 +2,23 @@
 
 ## 每次使用
 
+### 方法 A：Windows 桌面 icon / shortcut
+
+如果你想像之前 Claude 幫你整的 icon 一樣，雙擊便自動跑 scanner：
+
+1. 在 Windows File Explorer 打開 repo folder
+2. 右鍵 `create_windows_shortcut.ps1` → **Run with PowerShell**
+3. Desktop 會出現：`Minervini Scanner v3.0`
+4. 之後雙擊這個 icon 即可自動在 WSL 跑 scanner，並打開最新 HTML report
+
+如果不想建立 `.lnk` shortcut，也可以直接雙擊：
+
+```text
+Minervini_Scan.bat
+```
+
+### 方法 B：WSL terminal 手動執行
+
 ```bash
 python minervini_scanner.py
 ```

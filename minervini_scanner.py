@@ -891,12 +891,30 @@ if __name__ == "__main__":
             print(f"    {r['ticker']:<6} RS={str(r['rs'] or 'N/A'):>3} Dist={r['dist']:+.1f}% Stop=${r['stop']}")
     print("=" * 60)
     import subprocess, shutil
-    desktop = "/mnt/c/Users/Wah Mui/Desktop"
-    report_name = os.path.basename(fpath)
-    if os.path.isdir(desktop):
-        shutil.copy(fpath, f"{desktop}/{report_name}")
-        win_file = f"C:\\Users\\Wah Mui\\Desktop\\{report_name}"
-        subprocess.Popen(["powershell.exe", "-Command", f"Start-Process '{win_file}'"])
-        print("Scan complete! Browser opening...")
-    else:
+
+    def open_report_on_windows(report_path):
+        """When running inside WSL, copy report to Windows Desktop and open it."""
+        try:
+            if shutil.which("powershell.exe") is None:
+                return False
+            report_name = os.path.basename(report_path)
+            desktop_win = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if not desktop_win:
+                return False
+            desktop_wsl = subprocess.check_output(["wslpath", "-u", desktop_win], text=True).strip()
+            if os.path.isdir(desktop_wsl):
+                desktop_report = os.path.join(desktop_wsl, report_name)
+                shutil.copy(report_path, desktop_report)
+                subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", f"Start-Process -FilePath '{desktop_win}\\{report_name}'"])
+                print(f"Scan complete! Browser opening: {desktop_win}\\{report_name}")
+                return True
+        except Exception:
+            return False
+        return False
+
+    if not open_report_on_windows(fpath):
         print(f"Scan complete! Report saved to {fpath}")
