@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 reports/*.html
 reports/*.md
+journal/*.csv
 *.pyc
 *.pyo
 .env
