@@ -5,12 +5,15 @@ import time, os, csv, math
 from pathlib import Path
 from datetime import datetime, date
 
+SCANNER_VERSION = "v3.0"
+LATEST_REPORT_NAME = "Minervini_Scanner_Latest_v3.html"
+
 WATCHLIST = [
     "NVDA","AAPL","MSFT","AMZN","GOOGL","META","AVGO","AMD","TSLA","ARM","PLTR","NFLX",
     "MU","MRVL","KLAC","LRCX","AMAT","ASML","MPWR","MCHP","NXPI","ONTO","ACLS","FORM",
     "CRWD","SNOW","DDOG","MDB","HUBS","APP","TTD","PANW","FTNT","ZS","NET","WDAY","ADSK",
     "NOW","ADBE","TWLO","AI","CLS","VRT","RKLB","DKNG","MSTR","UPST","FRPT","COIN",
-    "V","MA","HOOD","SQ","PYPL","GS","MS","BAC","AXP","BLK","SCHW",
+    "V","MA","HOOD","XYZ","PYPL","GS","MS","BAC","AXP","BLK","SCHW",
     "COST","BKNG","MELI","SHOP","UBER","ABNB","DUOL","ELF","CELH","WING","CVNA",
     "LLY","VRTX","REGN","ISRG","AMGN","TMO","DHR","SPOT","EA","COHR","LITE","AAOI","VIAV","CIEN",
     # Current AI infrastructure / momentum leaders that were missing from v2.0
@@ -771,7 +774,7 @@ def save_report(results, rd, scan_date):
 <html lang="zh-TW"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Minervini v3.0 — {scan_date}</title>
+<title>Minervini {SCANNER_VERSION} — {scan_date}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;color:#1d1d1f;font-size:14px}}
@@ -806,7 +809,7 @@ tr:hover td{{background:#fafafa}}
 .ft{{padding:12px 32px;color:#aaa;font-size:11px;text-align:center}}
 </style></head><body>
 <div class="hdr">
-  <h1>&#9889; Minervini Scanner &#8212; USIC 2026 <span style="font-size:14px;background:#7f5af0;color:#fff;padding:2px 10px;border-radius:12px;margin-left:8px">v3.0</span></h1>
+  <h1>&#9889; Minervini Scanner &#8212; USIC 2026 <span style="font-size:14px;background:#7f5af0;color:#fff;padding:2px 10px;border-radius:12px;margin-left:8px">{SCANNER_VERSION}</span></h1>
   <p>Date: {scan_date} | Scanned: {len(load_watchlist())} | Passed: {len(results)} | RS percentile | Risk/trade: {RISK_PER_TRADE_PCT}%</p>
 </div>
 <div class="rbar">
@@ -829,7 +832,7 @@ tr:hover td{{background:#fafafa}}
   <div class="met"><div class="met-l">Tier A setups</div><div class="met-v" style="color:#27a03a">{tier_a}</div></div>
 </div>
 {candidates_html}
-<div class="v2note">&#9888; v3.0: External watchlist · RS percentile · Local pivot distance · Setup status · VCP contraction depths · Earnings risk · Position sizing</div>
+<div class="v2note">&#9888; {SCANNER_VERSION}: External watchlist · RS percentile · Local pivot distance · Setup status · VCP contraction depths · Earnings risk · Position sizing</div>
 <div class="flt">
   <label>Search: <input type="text" id="sb" placeholder="ticker..." oninput="ft()"></label>
   <label>Tier: <select id="ts" onchange="ft()"><option value="">All</option><option>A</option><option>B</option><option>C</option></select></label>
@@ -842,7 +845,7 @@ tr:hover td{{background:#fafafa}}
   </tr></thead>
   <tbody id="tb">{rows}</tbody>
 </table></div>
-<div class="ft">Research only | Minervini Scanner v3.0 | {scan_date}</div>
+<div class="ft">Research only | Minervini Scanner {SCANNER_VERSION} | {scan_date}</div>
 <script>
 function ft(){{
   var q=document.getElementById('sb').value.toLowerCase();
@@ -863,6 +866,9 @@ function ft(){{
     fpath = os.path.join(out_dir, fname)
     with open(fpath, "w", encoding="utf-8") as f:
         f.write(html)
+    latest_path = os.path.join(out_dir, LATEST_REPORT_NAME)
+    with open(latest_path, "w", encoding="utf-8") as f:
+        f.write(html)
     return fpath
 
 if __name__ == "__main__":
@@ -872,7 +878,7 @@ if __name__ == "__main__":
     wp = abs_path.replace("/home/wahmui", "").replace("/", "\\")
     win_path = "\\\\wsl.localhost\\Ubuntu\\home\\wahmui" + wp
     print("=" * 60)
-    print(f"  {len(results)} stocks passed (v3.0 filters)")
+    print(f"  {len(results)} stocks passed ({SCANNER_VERSION} filters)")
     tier_a = [r for r in results if r["tier"]=="A"]
     tier_b = [r for r in results if r["tier"]=="B"]
     tier_c = [r for r in results if r["tier"]=="C"]
@@ -909,8 +915,12 @@ if __name__ == "__main__":
             if os.path.isdir(desktop_wsl):
                 desktop_report = os.path.join(desktop_wsl, report_name)
                 shutil.copy(report_path, desktop_report)
+                latest_report = os.path.join(os.path.dirname(report_path), LATEST_REPORT_NAME)
+                if os.path.exists(latest_report):
+                    shutil.copy(latest_report, os.path.join(desktop_wsl, LATEST_REPORT_NAME))
                 subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", f"Start-Process -FilePath '{desktop_win}\\{report_name}'"])
                 print(f"Scan complete! Browser opening: {desktop_win}\\{report_name}")
+                print(f"Latest v3 report also copied to: {desktop_win}\\{LATEST_REPORT_NAME}")
                 return True
         except Exception:
             return False

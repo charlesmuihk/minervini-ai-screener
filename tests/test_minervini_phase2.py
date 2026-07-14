@@ -56,3 +56,32 @@ def test_detect_vcp_details_exposes_contractions():
     assert details["score"] >= 6
     assert len(details["contractions"]) >= 2
     assert "depth_pct" in details["contractions"][-1]
+
+
+def test_report_renders_v3_branding_and_latest_copy():
+    rd = {
+        "regime": "BULL",
+        "label": "test regime",
+        "score": 7,
+        "spy": 500.0,
+        "spy_pts": 2,
+        "adv_pts": 2,
+        "nh_pts": 1,
+        "vix": 18.0,
+        "vix_pts": 2,
+        "qqq_pct": 96.0,
+        "pos_pct": 100,
+        "max_pos": "5-6 positions",
+    }
+    scan_date = "2099-01-01"
+    report_path = Path(m.save_report([], rd, scan_date))
+    latest_path = report_path.with_name(m.LATEST_REPORT_NAME)
+    try:
+        html = report_path.read_text(encoding="utf-8")
+        latest_html = latest_path.read_text(encoding="utf-8")
+        assert f"Minervini {m.SCANNER_VERSION}" in html
+        assert "Minervini Scanner v2.0" not in html
+        assert latest_html == html
+    finally:
+        report_path.unlink(missing_ok=True)
+        latest_path.unlink(missing_ok=True)

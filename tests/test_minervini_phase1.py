@@ -28,6 +28,11 @@ def test_watchlist_includes_current_ai_infrastructure_leaders():
         assert ticker in m.WATCHLIST
 
 
+def test_watchlist_uses_current_block_ticker_xyz_not_stale_sq():
+    assert "XYZ" in m.WATCHLIST
+    assert "SQ" not in m.WATCHLIST
+
+
 def test_classify_setup_status_marks_retest_zone_as_retest_watch():
     status = m.classify_setup_status(
         current_price=177,
