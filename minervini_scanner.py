@@ -5,7 +5,7 @@ import time, os, csv, math
 from pathlib import Path
 from datetime import datetime, date
 
-SCANNER_VERSION = "v3.0"
+SCANNER_VERSION = "v3.1"
 LATEST_REPORT_NAME = "Minervini_Scanner_Latest_v3.html"
 
 WATCHLIST = [
@@ -161,6 +161,89 @@ def calc_position_size(portfolio_value, risk_pct, entry_price, stop_price):
         "position_value": round(position_value, 2),
         "shares": shares,
     }
+
+
+def calculate_actionability_score(result):
+    """Score how close a passed stock is to an actionable Minervini setup, 0-100."""
+    score = 0
+    rs = result.get("rs") or 0
+    trend = result.get("trend") or 0
+    pivot_dist = result.get("pivot_dist")
+    stop_risk = result.get("stop_risk_pct")
+    vcp_score = result.get("vcp_score") or 0
+    earnings_risk = result.get("earnings_risk") or "Unknown"
+    setup_status = result.get("setup_status") or ""
+
+    score += min(20, max(0, (rs / 99) * 20))
+    score += min(15, max(0, (trend / 8) * 15))
+
+    if pivot_dist is None:
+        score += 0
+    elif -3 <= pivot_dist <= 3:
+        score += 20
+    elif -8 <= pivot_dist < -3 or 3 < pivot_dist <= 5:
+        score += 14
+    elif -15 <= pivot_dist < -8 or 5 < pivot_dist <= 8:
+        score += 8
+    elif pivot_dist > 8:
+        score += 2
+
+    if stop_risk is None:
+        score += 5
+    elif stop_risk <= 5:
+        score += 15
+    elif stop_risk <= 8:
+        score += 12
+    elif stop_risk <= 10:
+        score += 7
+
+    score += min(15, max(0, (vcp_score / 10) * 15))
+    score += {"Low": 10, "Watch": 7, "Medium": 4, "Unknown": 5, "Past": 5, "High": 0}.get(earnings_risk, 5)
+    score += {"Actionable Pivot": 5, "Retest Watch": 5, "Pivot Approaching": 5, "Setup Forming": 3}.get(setup_status, 0)
+
+    return int(round(min(100, score)))
+
+
+def build_trade_plan(result):
+    pivot = result.get("pivot_price")
+    price = result.get("price")
+    stop = result.get("stop")
+    risk = result.get("stop_risk_pct")
+    setup = result.get("setup_status") or "Watch"
+    if pivot:
+        if setup == "Setup Forming":
+            entry = f"watch below ${pivot:,.2f}; act only near/through pivot"
+        elif setup == "Retest Watch":
+            entry = f"retest/hold near ${pivot:,.2f}"
+        else:
+            entry = f"${pivot:,.2f} pivot zone"
+    else:
+        entry = f"watch current area ${price:,.2f}" if price else "watch only"
+    invalidation = f"close below ${stop:,.2f}" if stop else "breaks base support"
+    return {
+        "entry": entry,
+        "stop": stop,
+        "risk": risk,
+        "invalidation": invalidation,
+        "size": result.get("shares"),
+    }
+
+
+def build_focus_lists(results, limit=5):
+    enriched = []
+    for r in results:
+        if "action_score" not in r:
+            r = dict(r)
+            r["action_score"] = calculate_actionability_score(r)
+        enriched.append(r)
+    ranked = sorted(enriched, key=lambda r: (-r.get("action_score", 0), r.get("tier", "Z"), abs(r.get("pivot_dist") if r.get("pivot_dist") is not None else 99)))
+    actionable_status = {"Actionable Pivot", "Retest Watch", "Pivot Approaching"}
+    actionable = [r for r in ranked if r.get("setup_status") in actionable_status and (r.get("pivot_dist") is None or r.get("pivot_dist") <= 5)][:limit]
+    used = {r["ticker"] for r in actionable}
+    watch = [r for r in ranked if r["ticker"] not in used and r.get("setup_status") == "Setup Forming"][:limit]
+    used.update(r["ticker"] for r in watch)
+    leadership = [r for r in ranked if r["ticker"] not in used][:limit]
+    return {"actionable_today": actionable, "watch_tomorrow": watch, "leadership_not_buyable": leadership}
 
 
 def get_market_regime():
@@ -518,7 +601,7 @@ def scan():
     scan_date = datetime.now().strftime("%Y-%m-%d")
     tickers = load_watchlist()
     print("=" * 60)
-    print(f"  Minervini Scanner v3.0 — {scan_date}")
+    print(f"  Minervini Scanner {SCANNER_VERSION} — {scan_date}")
     print("=" * 60)
     print("  Checking market regime...")
     rd = get_market_regime()
@@ -626,6 +709,8 @@ def scan():
                     "hist_pivot_dist": hist_pivot_dist,
                     "hist_pivot_method": hist_pivot_method,
                 })
+                results[-1]["action_score"] = calculate_actionability_score(results[-1])
+                results[-1]["trade_plan"] = build_trade_plan(results[-1])
                 vcp_tag = " [VCP]" if is_vcp else ""
                 print(f"PASS RS={rs} Pivot={pivot_dist if pivot_dist is not None else 'N/A'}% {setup_status} Tier={tier}{vcp_tag}")
             else:
@@ -704,6 +789,33 @@ def build_html(results, rd, scan_date):
         return f"<span style='color:{color};font-weight:600'>{risk}</span><br><span style='font-size:10px;color:#888'>{date_txt} {day_txt}</span>"
 
     r_col = {"BULL":"#27a03a","NEUTRAL":"#f5a623","BEAR":"#e24b4a"}.get(rd["regime"],"#888")
+
+    def focus_card(r):
+        plan = r.get("trade_plan") or build_trade_plan(r)
+        score = r.get("action_score", calculate_actionability_score(r))
+        pivot_txt = f"Pivot ${r.get('pivot_price'):,.2f}" if r.get("pivot_price") else "No pivot"
+        return (
+            "<div style='background:#fff;border-radius:10px;padding:10px 12px;box-shadow:0 1px 3px rgba(0,0,0,.07);min-width:210px'>"
+            f"<div style='display:flex;justify-content:space-between;gap:8px'><strong>{r['ticker']}</strong><span style='background:#1d1d1f;color:#fff;border-radius:12px;padding:1px 8px;font-size:11px'>Score {score}</span></div>"
+            f"<div style='font-size:12px;color:#555'>{r.get('setup_status','—')} · RS {r.get('rs','N/A')}</div>"
+            f"<div style='font-size:12px;color:#888'>{pivot_txt} ({r.get('pivot_dist','N/A')}%)</div>"
+            f"<div style='font-size:11px;color:#888'>Entry: {plan['entry']}<br>Stop: {plan['invalidation']}</div>"
+            "</div>"
+        )
+
+    focus = build_focus_lists(results, limit=5)
+    def focus_section(title, items):
+        if not items:
+            return f"<div class='cands-empty'>{title}: no names today</div>"
+        return f"<div class='cands-title'>{title}</div><div style='display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px'>{''.join(focus_card(r) for r in items)}</div>"
+    focus_html = (
+        "<div class='cands'>"
+        + focus_section("🎯 Actionable Today", focus["actionable_today"])
+        + focus_section("👀 Watch Tomorrow", focus["watch_tomorrow"])
+        + focus_section("🏃 Leadership But Not Buyable", focus["leadership_not_buyable"])
+        + "</div>"
+    )
+
     rows = ""
     for r in results:
         dist_col = "#27a03a" if r["dist"]>=-3 else ("#f5a623" if r["dist"]>=-10 else "#e24b4a")
@@ -711,7 +823,7 @@ def build_html(results, rd, scan_date):
         vcp_badge = "<span style='background:#7f5af0;color:#fff;padding:2px 7px;border-radius:10px;font-size:11px;margin-left:4px'>VCP</span>" if r["is_vcp"] else ""
         rows += f"""<tr>
           <td style='position:sticky;left:0;background:#fff;z-index:1'><strong>{r['ticker']}</strong>{vcp_badge}<br><span style='font-size:11px;color:#888'>{r['sector']}</span></td>
-          <td><span style='background:{tier_col};color:#fff;padding:2px 8px;border-radius:10px;font-size:12px'>Tier {r['tier']}</span></td>
+          <td><span style='background:{tier_col};color:#fff;padding:2px 8px;border-radius:10px;font-size:12px'>Tier {r['tier']}</span><br><span style='font-size:11px;color:#1d1d1f'>Action {r.get('action_score', calculate_actionability_score(r))}</span></td>
           <td>${r['price']:,.2f}</td>
           <td style='color:{dist_col};font-weight:600'>{r['dist']:+.1f}%</td>
           <td>{trend_bar(r['trend'],r['checks'])}</td>
@@ -765,10 +877,55 @@ def build_html(results, rd, scan_date):
             "</div>"
         )
 
-    return avg_rs, near5, vcp_cnt, tier_a, rows, r_col, candidates_html
+    return avg_rs, near5, vcp_cnt, tier_a, rows, r_col, candidates_html, focus_html
+
+def save_markdown_alert(results, rd, scan_date):
+    focus = build_focus_lists(results, limit=5)
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"minervini_alerts_{scan_date}.md")
+
+    def line_for(r):
+        plan = r.get("trade_plan") or build_trade_plan(r)
+        score = r.get("action_score", calculate_actionability_score(r))
+        pivot = f"${r.get('pivot_price'):,.2f}" if r.get("pivot_price") else "N/A"
+        risk = f"{plan.get('risk')}%" if plan.get("risk") is not None else "N/A"
+        stop = f"${plan.get('stop'):,.2f}" if plan.get("stop") else "N/A"
+        return (
+            f"- **{r['ticker']}** — Score {score} | Tier {r.get('tier')} | {r.get('setup_status')} | "
+            f"RS {r.get('rs')} | Pivot {pivot} ({r.get('pivot_dist')}%) | "
+            f"Entry: {plan['entry']} | Stop: {stop} | Risk: {risk} | Invalidation: {plan['invalidation']}"
+        )
+
+    sections = [
+        f"# Minervini {SCANNER_VERSION} Alerts — {scan_date}",
+        "",
+        f"Market: **{rd.get('regime')} {rd.get('score')}/8** | Position sizing: **{rd.get('pos_pct')}% — {rd.get('max_pos')}**",
+        "",
+        "## Actionable Today",
+        *(line_for(r) for r in focus["actionable_today"]),
+        "_None_" if not focus["actionable_today"] else "",
+        "",
+        "## Watch Tomorrow",
+        *(line_for(r) for r in focus["watch_tomorrow"]),
+        "_None_" if not focus["watch_tomorrow"] else "",
+        "",
+        "## Leadership But Not Buyable",
+        *(line_for(r) for r in focus["leadership_not_buyable"]),
+        "_None_" if not focus["leadership_not_buyable"] else "",
+        "",
+        "## Risk Note",
+        "Scanner output is a watchlist, not a buy command. Wait for pivot/volume confirmation and respect stops.",
+        "",
+    ]
+    text = "\n".join(s for s in sections if s != "") + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
 
 def save_report(results, rd, scan_date):
-    avg_rs, near5, vcp_cnt, tier_a, rows, r_col, candidates_html = build_html(results, rd, scan_date)
+    avg_rs, near5, vcp_cnt, tier_a, rows, r_col, candidates_html, focus_html = build_html(results, rd, scan_date)
     pos_label = f"{rd['pos_pct']}% allocated — {rd['max_pos']}"
     html = f"""<!DOCTYPE html>
 <html lang="zh-TW"><head>
@@ -831,8 +988,9 @@ tr:hover td{{background:#fafafa}}
   <div class="met"><div class="met-l">VCP patterns</div><div class="met-v" style="color:#7f5af0">{vcp_cnt}</div></div>
   <div class="met"><div class="met-l">Tier A setups</div><div class="met-v" style="color:#27a03a">{tier_a}</div></div>
 </div>
+{focus_html}
 {candidates_html}
-<div class="v2note">&#9888; {SCANNER_VERSION}: External watchlist · RS percentile · Local pivot distance · Setup status · VCP contraction depths · Earnings risk · Position sizing</div>
+<div class="v2note">&#9888; {SCANNER_VERSION}: External watchlist · RS percentile · Local pivot distance · Actionability Score · Top focus list · Markdown alerts · Setup status · VCP contraction depths · Earnings risk · Position sizing</div>
 <div class="flt">
   <label>Search: <input type="text" id="sb" placeholder="ticker..." oninput="ft()"></label>
   <label>Tier: <select id="ts" onchange="ft()"><option value="">All</option><option>A</option><option>B</option><option>C</option></select></label>
@@ -874,6 +1032,7 @@ function ft(){{
 if __name__ == "__main__":
     results, rd, scan_date = scan()
     fpath = save_report(results, rd, scan_date)
+    md_path = save_markdown_alert(results, rd, scan_date)
     abs_path = os.path.abspath(fpath)
     wp = abs_path.replace("/home/wahmui", "").replace("/", "\\")
     win_path = "\\\\wsl.localhost\\Ubuntu\\home\\wahmui" + wp
@@ -928,3 +1087,4 @@ if __name__ == "__main__":
 
     if not open_report_on_windows(fpath):
         print(f"Scan complete! Report saved to {fpath}")
+    print(f"Markdown alerts saved to {md_path}")

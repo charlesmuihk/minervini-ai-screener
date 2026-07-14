@@ -85,3 +85,61 @@ def test_report_renders_v3_branding_and_latest_copy():
     finally:
         report_path.unlink(missing_ok=True)
         latest_path.unlink(missing_ok=True)
+
+
+def sample_result(ticker, tier, rs, pivot_dist, setup_status, vcp_score, earnings_risk="Low"):
+    return {
+        "ticker": ticker,
+        "tier": tier,
+        "rs": rs,
+        "trend": 8,
+        "pivot_dist": pivot_dist,
+        "stop_risk_pct": 6.0,
+        "vcp_score": vcp_score,
+        "earnings_risk": earnings_risk,
+        "setup_status": setup_status,
+        "pattern": "VCP" if vcp_score else "BASE",
+        "price": 100.0,
+        "pivot_price": 101.0,
+        "stop": 94.0,
+        "shares": 166,
+        "position_value": 16600.0,
+    }
+
+
+def test_actionability_score_rewards_near_pivot_vcp_and_penalizes_earnings():
+    clean = sample_result("DDOG", "A", 90, -0.3, "Pivot Approaching", 8, "Low")
+    risky = sample_result("RISK", "A", 90, -0.3, "Pivot Approaching", 8, "High")
+    far = sample_result("MU", "C", 99, -21.7, "Leadership Candidate", 0, "Low")
+
+    assert m.calculate_actionability_score(clean) >= 85
+    assert m.calculate_actionability_score(risky) < m.calculate_actionability_score(clean)
+    assert m.calculate_actionability_score(far) < 70
+
+
+def test_focus_lists_prioritize_actionable_today_then_watch_tomorrow():
+    results = [
+        sample_result("MU", "C", 99, -21.7, "Leadership Candidate", 0),
+        sample_result("DDOG", "A", 90, -0.3, "Pivot Approaching", 8),
+        sample_result("AMD", "B", 95, -6.3, "Setup Forming", 7),
+        sample_result("NET", "B", 72, 0.6, "Actionable Pivot", 7),
+    ]
+    focus = m.build_focus_lists(results, limit=3)
+
+    assert [r["ticker"] for r in focus["actionable_today"]][:2] == ["DDOG", "NET"]
+    assert [r["ticker"] for r in focus["watch_tomorrow"]] == ["AMD"]
+    assert [r["ticker"] for r in focus["leadership_not_buyable"]] == ["MU"]
+
+
+def test_markdown_alert_report_contains_focus_sections_and_trade_plan():
+    rd = {"regime": "BULL", "score": 7, "pos_pct": 100, "max_pos": "5-6 positions"}
+    results = [sample_result("DDOG", "A", 90, -0.3, "Pivot Approaching", 8)]
+    report_path = Path(m.save_markdown_alert(results, rd, "2099-01-02"))
+    try:
+        text = report_path.read_text(encoding="utf-8")
+        assert "Minervini v3.1 Alerts" in text
+        assert "Actionable Today" in text
+        assert "DDOG" in text
+        assert "Entry" in text and "Stop" in text and "Risk" in text
+    finally:
+        report_path.unlink(missing_ok=True)

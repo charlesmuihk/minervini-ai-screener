@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title Minervini Scanner v3.0
+title Minervini Scanner v3.1
 
 echo ============================================================
-echo   Minervini Scanner v3.0
+echo   Minervini Scanner v3.1
 echo ============================================================
 echo.
 
