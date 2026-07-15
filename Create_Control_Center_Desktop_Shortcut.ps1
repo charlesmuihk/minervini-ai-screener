@@ -17,7 +17,7 @@ $wslCommand = "set -e; " +
     "git pull --ff-only origin main || true; " +
     "if [ ! -d .venv ]; then if command -v uv >/dev/null 2>&1; then uv venv .venv && . .venv/bin/activate && uv pip install -r requirements.txt; else python3 -m venv .venv && . .venv/bin/activate && python -m pip install -r requirements.txt; fi; else . .venv/bin/activate; fi; " +
     "if ! python -c 'import streamlit' >/dev/null 2>&1; then if command -v uv >/dev/null 2>&1; then uv pip install -r requirements.txt; else python -m ensurepip --upgrade && python -m pip install -r requirements.txt; fi; fi; " +
-    "if command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile -Command \"Start-Process 'http://localhost:8501'\" >/dev/null 2>&1 || true; fi; " +
+    "if command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile -Command 'Start-Process http://localhost:8501' >/dev/null 2>&1 || true; fi; " +
     "python -m streamlit run control_center.py --server.address 0.0.0.0 --server.port 8501"
 
 $wsh = New-Object -ComObject WScript.Shell
