@@ -10,11 +10,20 @@ git pull origin main
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w Create_Control_Center_Desktop_Shortcut.ps1)"
 ```
 
-Then double-click this Windows Desktop shortcut:
+Then double-click this Windows Desktop shortcut/file:
 
 ```text
 Minervini Control Center
 ```
+
+The setup script now creates both:
+
+```text
+Minervini Control Center.cmd
+Minervini Control Center.lnk
+```
+
+If the shortcut gives a Windows permission/path warning, double-click the `.cmd` file directly.
 
 It opens:
 

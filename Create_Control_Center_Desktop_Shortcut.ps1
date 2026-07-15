@@ -20,14 +20,30 @@ $wslCommand = "set -e; " +
     "if command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile -Command 'Start-Process http://localhost:8501' >/dev/null 2>&1 || true; fi; " +
     "python -m streamlit run control_center.py --server.address 0.0.0.0 --server.port 8501"
 
+$launcherPath = Join-Path $desktop "Minervini Control Center.cmd"
+$cmdContent = @"
+@echo off
+title Minervini Control Center
+echo ============================================================
+echo   Minervini Control Center
+echo ============================================================
+echo.
+"$wslExe" bash -lc "$wslCommand"
+echo.
+echo Control Center stopped.
+pause
+"@
+[System.IO.File]::WriteAllText($launcherPath, $cmdContent, [System.Text.Encoding]::ASCII)
+
 $wsh = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = $wslExe
-$shortcut.Arguments = "bash -lc `"$wslCommand`""
+$shortcut.TargetPath = $launcherPath
+$shortcut.Arguments = ""
 $shortcut.WorkingDirectory = $desktop
 $shortcut.Description = "Open Minervini Scanner Control Center v1.0"
 $shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,167"
 $shortcut.Save()
 
+Write-Host "Created desktop launcher: $launcherPath"
 Write-Host "Created desktop shortcut: $shortcutPath"
 Write-Host "Double-click 'Minervini Control Center' on your Desktop to open http://localhost:8501"
