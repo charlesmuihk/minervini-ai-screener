@@ -19,7 +19,7 @@ $wslCommand = "set -e; " +
     "if ! python -c 'import streamlit' >/dev/null 2>&1; then if command -v uv >/dev/null 2>&1; then uv pip install -r requirements.txt; else python -m ensurepip --upgrade && python -m pip install -r requirements.txt; fi; fi; " +
     "mkdir -p .streamlit && printf '[browser]\\ngatherUsageStats = false\\n' > .streamlit/config.toml; " +
     "if command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile -Command 'Start-Process http://localhost:8501' >/dev/null 2>&1 || true; fi; " +
-    "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false python -m streamlit run control_center.py --server.address 0.0.0.0 --server.port 8501"
+    "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false python -m streamlit run control_center.py --server.address 0.0.0.0 --server.port 8501 --server.headless true"
 
 $launcherPath = Join-Path $desktop "Minervini Control Center.cmd"
 $cmdContent = @"
